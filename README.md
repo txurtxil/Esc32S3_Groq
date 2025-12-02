@@ -102,14 +102,16 @@ El ESP32 se reiniciará, se conectará a tu WiFi y luego buscará el servidor We
 Consola Python: Deberías ver 🔌 ROBOT CONECTADO.
 Uso: Pulsa el botón "BOOT" (o toca la pantalla táctil) para hablar.
 
+subo el firmware precompilado "firmware_xiaozhi_completo.bin" listo para apuntar a la IP privada 192.168.1.175 que es donde tiene que fucionar server.py
+flasheable desde https://espressif.github.io/esptool-js/
+
 🐞 Solución de Problemas Comunes
 Error lang_config.h: Si al compilar dice que falta este archivo, verifica que existe en main/assets/lang_config.h. Este repo ya debería incluir el parche manual.
 El robot no habla (pero hay texto): Verifica que tienes FFmpeg instalado y accesible desde la terminal (ffmpeg -version).
 
 Error de compilación format %x: Se ha aplicado un parche en image_to_jpeg.cpp y en CMakeLists.txt para ignorar estos errores en compiladores nuevos.
 
-subo en firmware firmware_xiaozhi_completo.bin listo para apuntar a la IP privada 192.168.1.175 que es donde devera fucionar server.py
-flasheable desde https://espressif.github.io/esptool-js/
+
 
 ⚖️ Créditos y Licencia
 Basado en el trabajo original de Xiaozhi ESP32.
