@@ -24,7 +24,7 @@ except ImportError:
 # --- CONFIGURACIÓN POR DEFECTO ---
 CONFIG_FILE = 'config.json'
 DEFAULT_CONFIG = {
-    "groq_api_key": "gsk_--------",
+    "groq_api_key": "gsk_---------",
     "system_prompt": "Eres Xiaozhi, un asistente útil y breve.",
     "model": "llama-3.3-70b-versatile",
     "voice": "es-ES-AlvaroNeural",
@@ -42,6 +42,19 @@ GROQ_MODELS = [
     "llama-3.1-8b-instant",
     "gemma2-9b-it"
 ]
+
+# --- OPCIONES DE VOZ (NUEVO) ---
+# Formato: "ID_Edge_TTS": "Nombre legible"
+VOICE_OPTIONS = {
+    "es-ES-AlvaroNeural": "🇪🇸 Álvaro (Hombre - España)",
+    "es-ES-ElviraNeural": "🇪🇸 Elvira (Mujer - España)",
+    "es-MX-DaliaNeural": "🇲🇽 Dalia (Mujer - México)",
+    "es-MX-JorgeNeural": "🇲🇽 Jorge (Hombre - México)",
+    "es-AR-TomasNeural": "🇦🇷 Tomás (Hombre - Argentina)",
+    "es-CO-SalomeNeural": "🇨🇴 Salomé (Mujer - Colombia)",
+    "en-US-ChristopherNeural": "🇺🇸 Christopher (Hombre - Inglés)",
+    "en-US-AriaNeural": "🇺🇸 Aria (Mujer - Inglés)"
+}
 
 # AUDIO ROBOT
 INPUT_RATE = 16000
@@ -141,7 +154,7 @@ def process_full_interaction(pcm_data, ws):
 
     # 4. TTS (MODIFICADO PARA ENVIAR OPUS)
     try:
-        log_msg("--> Generando voz...")
+        log_msg(f"--> Generando voz ({config['voice']})...")
         pcm_audio = asyncio.run(generate_tts_pcm(ai_response))
         
         if pcm_audio:
@@ -155,7 +168,6 @@ def process_full_interaction(pcm_data, ws):
                 
                 # Definir tamaño de frame Opus (muestras)
                 # 960 muestras = 60ms a 16kHz. 
-                # Bytes PCM necesarios = 960 * 2 (16bit) = 1920 bytes
                 OPUS_FRAME_SAMPLES = 960
                 PCM_CHUNK_BYTES = OPUS_FRAME_SAMPLES * 2 
                 
@@ -172,7 +184,6 @@ def process_full_interaction(pcm_data, ws):
                         ws.send(encoded_packet)
                         
                         # Esperar aprox. la duración del audio (60ms) para no saturar
-                        # Usamos 0.058s para ir un poco por delante y evitar cortes
                         time.sleep(0.058) 
                     except Exception as opus_err:
                         print(f"Error encode: {opus_err}")
@@ -187,7 +198,8 @@ def process_full_interaction(pcm_data, ws):
 async def generate_tts_pcm(text):
     # Aplicar velocidad de voz
     rate = config.get('tts_rate', '+0%')
-    communicate = edge_tts.Communicate(text, config['voice'], rate=rate)
+    voice = config.get('voice', 'es-ES-AlvaroNeural') # Obtener voz de la config
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
     
     mp3_data = b""
     async for chunk in communicate.stream():
@@ -215,7 +227,7 @@ HTML_TEMPLATE = """
 <html lang="es">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🎛️ Xiaozhi V8 Panel (Opus Fix)</title>
+    <title>🎛️ Xiaozhi V8 Panel (Voz Selector)</title>
     <style>
         body { background: #121212; color: #ddd; font-family: sans-serif; padding: 10px; margin: 0; }
         .container { max-width: 800px; margin: 0 auto; }
@@ -244,8 +256,12 @@ HTML_TEMPLATE = """
                         </select>
                     </div>
                     <div>
-                        <label>🌡️ Creatividad (Temp): <span id="temp_val" class="range-val">{{ config.llm_temperature }}</span></label>
-                        <input type="range" name="llm_temperature" min="0" max="1" step="0.1" value="{{ config.llm_temperature }}" oninput="document.getElementById('temp_val').innerText=this.value">
+                        <label>🗣️ Voz (Personaje)</label>
+                        <select name="voice">
+                            {% for v_id, v_name in voices.items() %}
+                            <option value="{{ v_id }}" {% if config.voice == v_id %}selected{% endif %}>{{ v_name }}</option>
+                            {% endfor %}
+                        </select>
                     </div>
                 </div>
 
@@ -267,10 +283,9 @@ HTML_TEMPLATE = """
                     <div>
                         <label>🎤 Ganancia Micro (x): <span id="gain_val" class="range-val">{{ config.mic_gain }}</span></label>
                         <input type="range" name="mic_gain" min="0.5" max="5.0" step="0.1" value="{{ config.mic_gain }}" oninput="document.getElementById('gain_val').innerText=this.value">
-                        <small>Sube esto si entiende mal palabras.</small>
                     </div>
                     <div>
-                        <label>🗣️ Velocidad Voz</label>
+                        <label>⏩ Velocidad Voz</label>
                         <select name="tts_rate">
                             <option value="-20%" {% if config.tts_rate == '-20%' %}selected{% endif %}>Lenta (-20%)</option>
                             <option value="+0%" {% if config.tts_rate == '+0%' %}selected{% endif %}>Normal</option>
@@ -279,11 +294,10 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
-                <div class="grid">
+                 <div class="grid">
                     <div>
-                        <label>📦 Tamaño Paquete (Ignorado en modo Opus)</label>
-                        <input type="number" name="chunk_size" value="{{ config.chunk_size }}" disabled style="opacity: 0.5;">
-                        <small>Controlado automáticamente por Opus.</small>
+                         <label>🌡️ Creatividad (Temp)</label>
+                         <input type="range" name="llm_temperature" min="0" max="1" step="0.1" value="{{ config.llm_temperature }}">
                     </div>
                     <div>
                         <label>🔑 API Key</label>
@@ -329,7 +343,9 @@ def index():
     c.setdefault('tts_rate', '+0%')
     c.setdefault('chunk_size', 3200)
     c.setdefault('llm_temperature', 0.7)
-    return render_template_string(HTML_TEMPLATE, config=c, models=GROQ_MODELS)
+    c.setdefault('voice', 'es-ES-AlvaroNeural')
+    # Pasamos también la lista de voces a la plantilla
+    return render_template_string(HTML_TEMPLATE, config=c, models=GROQ_MODELS, voices=VOICE_OPTIONS)
 
 @app.route('/save_config', methods=['POST'])
 def save_conf():
@@ -338,17 +354,17 @@ def save_conf():
         "groq_api_key": request.form.get('groq_api_key'),
         "system_prompt": request.form.get('system_prompt'),
         "model": request.form.get('model'),
-        "voice": config['voice'], 
+        # Ahora leemos la voz del formulario
+        "voice": request.form.get('voice'), 
         "silence_threshold": int(request.form.get('silence_threshold')),
         "silence_duration": float(request.form.get('silence_duration')),
         "mic_gain": float(request.form.get('mic_gain')),
         "tts_rate": request.form.get('tts_rate'),
-        # Chunk size es menos relevante en Opus pero lo guardamos
         "chunk_size": 3200, 
         "llm_temperature": float(request.form.get('llm_temperature'))
     })
     save_config(config)
-    log_msg("⚙️ Configuración guardada.")
+    log_msg(f"⚙️ Configuración guardada. Voz actual: {config['voice']}")
     return jsonify({"status": "ok"})
 
 @app.route('/get_logs')
@@ -377,7 +393,6 @@ def websocket_handler(ws):
             if isinstance(data, str):
                 msg = json.loads(data)
                 if msg.get('type') == 'hello':
-                    # CAMBIO: Decimos que usamos OPUS
                     ws.send(json.dumps({
                         "type": "hello", 
                         "transport": "websocket", 
@@ -403,16 +418,12 @@ def websocket_handler(ws):
             elif isinstance(data, bytes):
                 if is_recording:
                     try:
-                        # Decodificar entrada (Opus -> PCM) si es necesario
-                        # Muchos robots envían Opus.
                         if decoder: 
                             try:
                                 pcm_chunk = decoder.decode(data, FRAME_SIZE)
                             except:
-                                # Fallback si falla decode (a veces envían pcm mezclado)
                                 pcm_chunk = b'\x00' * 320
                         else: 
-                            # Si no hay decoder, asumimos raw (raro si es opus)
                             pcm_chunk = data
                         
                         pcm_buffer += pcm_chunk
@@ -421,7 +432,6 @@ def websocket_handler(ws):
                         if vol > config['silence_threshold']:
                             last_speech_time = time.time()
                         
-                        # MIN_RECORD_SECONDS = 3.0 para evitar cortes prematuros
                         if (time.time() - last_speech_time) > config['silence_duration'] and (time.time() - start_record_time) > 2.0:
                             log_msg("⏹️ Silencio detectado.")
                             is_recording = False
@@ -435,7 +445,6 @@ def websocket_handler(ws):
         log_msg(f"❌ Desconexión: {e}")
 
 if __name__ == '__main__':
-    # Verificar FFMPEG al inicio
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
