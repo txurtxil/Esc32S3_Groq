@@ -108,6 +108,8 @@ El robot no habla (pero hay texto): Verifica que tienes FFmpeg instalado y acces
 
 Error de compilación format %x: Se ha aplicado un parche en image_to_jpeg.cpp y en CMakeLists.txt para ignorar estos errores en compiladores nuevos.
 
+subo en firmware firmware_xiaozhi_completo.bin listo para apuntar a la IP privada 192.168.1.175 que es donde devera fucionar server.py
+flasheable desde https://espressif.github.io/esptool-js/
 
 ⚖️ Créditos y Licencia
 Basado en el trabajo original de Xiaozhi ESP32.
