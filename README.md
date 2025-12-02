@@ -94,15 +94,22 @@ python server.py
 Verás un mensaje indicando que el servidor corre en el puerto 8000.
 📶 Primer Uso
 Con el servidor Python corriendo, enciende el ESP32.
+
 Si es la primera vez, el ESP32 creará un Punto de Acceso WiFi (Hotspot).
 Conéctate a ese WiFi con tu móvil y configura los datos de tu router (SSID y Contraseña).
 El ESP32 se reiniciará, se conectará a tu WiFi y luego buscará el servidor WebSocket.
+
 Consola Python: Deberías ver 🔌 ROBOT CONECTADO.
 Uso: Pulsa el botón "BOOT" (o toca la pantalla táctil) para hablar.
+
 🐞 Solución de Problemas Comunes
 Error lang_config.h: Si al compilar dice que falta este archivo, verifica que existe en main/assets/lang_config.h. Este repo ya debería incluir el parche manual.
 El robot no habla (pero hay texto): Verifica que tienes FFmpeg instalado y accesible desde la terminal (ffmpeg -version).
+
 Error de compilación format %x: Se ha aplicado un parche en image_to_jpeg.cpp y en CMakeLists.txt para ignorar estos errores en compiladores nuevos.
+
+
 ⚖️ Créditos y Licencia
 Basado en el trabajo original de Xiaozhi ESP32.
+
 Modificaciones realizadas para hardware Spotpear y uso educativo local.
