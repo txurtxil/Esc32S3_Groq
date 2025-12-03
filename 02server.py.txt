@@ -1,0 +1,532 @@
+import os
+import json
+import wave
+import time
+import logging
+import struct
+import io
+import subprocess
+import asyncio
+import audioop
+import math
+import uuid
+from datetime import datetime
+from flask import Flask, render_template_string, request, jsonify, Response
+from flask_sock import Sock
+from groq import Groq
+import edge_tts
+
+# --- CONFIGURACIÓN E IMPORTACIONES ---
+try:
+    import opuslib
+except ImportError:
+    print("❌ ADVERTENCIA: 'opuslib' no está instalado. Ejecuta: pip install opuslib")
+    opuslib = None
+
+CONFIG_FILE = 'config.json'
+CHATS_FILE = 'chats.json'
+
+# --- PRESETS Y DATOS ---
+VOICE_OPTIONS = [
+    {"id": "es-ES-AlvaroNeural", "name": "🇪🇸 Álvaro (Hombre)"},
+    {"id": "es-ES-ElviraNeural", "name": "🇪🇸 Elvira (Mujer)"},
+    {"id": "es-AR-TomasNeural", "name": "🇦🇷 Tomás (Argentino)"},
+    {"id": "es-MX-DaliaNeural", "name": "🇲🇽 Dalia (Mexicana)"},
+    {"id": "en-US-ChristopherNeural", "name": "🇺🇸 Christopher (English)"},
+    {"id": "en-US-JennyNeural", "name": "🇺🇸 Jenny (English)"}
+]
+
+PROMPT_PRESETS = {
+    "default": "Eres Xiaozhi, un asistente útil, breve y amable.",
+    "sysadmin": "Eres un Experto en Sistemas. Respondes con comandos de terminal y soluciones de redes. Breve y técnico.",
+    "lawyer": "Eres un Abogado experto. Usas lenguaje formal y citas leyes cuando es necesario.",
+    "historian": "Eres un Historiador. Te encanta dar contexto, fechas y causas de los eventos.",
+    "sarcastic": "Eres un robot sarcástico. Ayudas, pero te quejas de los humanos con humor ácido.",
+    "programmer": "Eres Senior Dev. Respondes solo con código (Python/C++/JS) y mínimos comentarios.",
+    "translator": "Actúa como traductor. Traduce cualquier texto al inglés (o al español si ya es inglés). Sin charla extra."
+}
+
+DEFAULT_CONFIG = {
+    "groq_api_key": "gsk_PON_AQUI_TU_KEY_SI_NO_ESTA_GUARDADA",
+    "system_prompt": PROMPT_PRESETS["default"],
+    "model": "llama-3.3-70b-versatile",
+    "voice": "es-ES-AlvaroNeural",
+    "mic_gain": 1.0,
+    "tts_rate": "+0%",
+    "llm_temperature": 0.7,
+    "silence_threshold": 1000,
+    "silence_duration": 2.0
+}
+
+GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it", "openai/gpt-oss-120b"]
+
+# --- GESTIÓN DE CHATS ---
+def load_chats():
+    if os.path.exists(CHATS_FILE):
+        try:
+            with open(CHATS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except: pass
+    initial_id = str(uuid.uuid4())
+    return {
+        "active_id": initial_id,
+        "sessions": {
+            initial_id: {"name": "Chat General", "created": str(datetime.now()), "messages": []}
+        }
+    }
+
+def save_chats(data):
+    with open(CHATS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+chat_db = load_chats()
+
+def add_message(role, text):
+    aid = chat_db["active_id"]
+    if aid not in chat_db["sessions"]:
+        chat_db["sessions"][aid] = {"name": "Nuevo Chat", "created": str(datetime.now()), "messages": []}
+    
+    msg = {"role": role, "text": text, "time": datetime.now().strftime("%H:%M:%S")}
+    chat_db["sessions"][aid]["messages"].append(msg)
+    save_chats(chat_db)
+
+# --- VARIABLES GLOBALES ---
+active_ws = None 
+web_logs = []
+
+def log_system(msg):
+    print(msg)
+    ts = time.strftime("%H:%M:%S")
+    web_logs.append(f"[{ts}] {msg}")
+    if len(web_logs) > 50: web_logs.pop(0)
+
+# --- FLASK APP ---
+app = Flask(__name__)
+sock = Sock(app)
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return {**DEFAULT_CONFIG, **json.load(f)}
+        except: pass
+    return DEFAULT_CONFIG.copy()
+
+def save_app_config(new_config):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(new_config, f, indent=4)
+
+config = load_config()
+
+# --- AUDIO & LOGIC ---
+INPUT_RATE = 16000
+INPUT_CHANNELS = 1
+OUTPUT_RATE = 16000
+OUTPUT_CHANNELS = 1
+FRAME_SIZE = 960
+
+def amplify_audio(pcm_data, factor):
+    if factor == 1.0: return pcm_data
+    try: return audioop.mul(pcm_data, 2, factor) 
+    except: return pcm_data
+
+def speak_to_robot(text, ws):
+    if not ws: return
+    try:
+        log_system("--> Generando voz...")
+        pcm_audio = asyncio.run(generate_tts_pcm(text))
+        if pcm_audio:
+            try: ws.send(json.dumps({"type": "tts", "state": "start"}))
+            except: return
+            
+            if opuslib:
+                encoder = opuslib.Encoder(OUTPUT_RATE, OUTPUT_CHANNELS, opuslib.APPLICATION_VOIP)
+                PCM_CHUNK = 960 * 2
+                for i in range(0, len(pcm_audio), PCM_CHUNK):
+                    chunk = pcm_audio[i:i+PCM_CHUNK]
+                    if len(chunk) < PCM_CHUNK: chunk += b'\x00' * (PCM_CHUNK - len(chunk))
+                    try:
+                        ws.send(encoder.encode(chunk, 960))
+                        time.sleep(0.058)
+                    except: pass
+            
+            try: ws.send(json.dumps({"type": "tts", "state": "stop"}))
+            except: pass
+    except Exception as e: log_system(f"Error TTS: {e}")
+
+def process_voice_interaction(pcm_data, ws):
+    if config.get('mic_gain', 1.0) != 1.0:
+        pcm_data = amplify_audio(pcm_data, config['mic_gain'])
+    
+    if len(pcm_data) < 4000: return
+
+    try:
+        if not config['groq_api_key']: return
+        client = Groq(api_key=config['groq_api_key'])
+        
+        # 1. STT
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+            wf.writeframes(pcm_data)
+        wav_buffer.seek(0)
+        
+        ws.send(json.dumps({"type": "state", "state": "processing", "text": "Escuchando..."}))
+        transcription = client.audio.transcriptions.create(
+            file=("input.wav", wav_buffer.read()),
+            model="whisper-large-v3-turbo", language="es"
+        )
+        user_text = transcription.text
+        log_system(f"Voz: {user_text}")
+        add_message("user", user_text)
+
+        ws.send(json.dumps({"type": "state", "state": "processing", "text": user_text}))
+
+        # 2. LLM
+        completion = client.chat.completions.create(
+            model=config['model'],
+            messages=[
+                {"role": "system", "content": config['system_prompt']},
+                {"role": "user", "content": user_text}
+            ],
+            temperature=config['llm_temperature']
+        )
+        ai_resp = completion.choices[0].message.content
+        add_message("ai", ai_resp)
+        speak_to_robot(ai_resp, ws)
+
+    except Exception as e:
+        log_system(f"Error Pipeline: {e}")
+
+async def generate_tts_pcm(text):
+    rate = config.get('tts_rate', '+0%')
+    voice = config.get('voice', 'es-ES-AlvaroNeural')
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
+    mp3 = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio": mp3 += chunk["data"]
+    try:
+        cmd = ["ffmpeg", "-y", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "pipe:1"]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        out, _ = proc.communicate(input=mp3)
+        return out
+    except: return b""
+
+def get_rms(pcm_chunk):
+    try:
+        count = len(pcm_chunk) // 2
+        shorts = struct.unpack(f"{count}h", pcm_chunk)
+        sum_sq = sum(n * n for n in shorts)
+        return int(math.sqrt(sum_sq / count))
+    except: return 0
+
+# --- INTERFAZ WEB CON INPUT FLOTANTE ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Xiaozhi Pro</title>
+    <style>
+        :root { --bg: #121212; --surf: #1e1e1e; --prim: #bb86fc; --sec: #03dac6; --txt: #e0e0e0; --border: #333; }
+        body { background: var(--bg); color: var(--txt); font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        
+        /* TABS CONTAINER */
+        .tab-bar {
+            background: #181818;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 10px;
+            overflow-x: auto;
+            flex-shrink: 0;
+            height: 45px;
+        }
+
+        .tab {
+            background: #252525;
+            color: #aaa;
+            padding: 8px 15px;
+            margin-right: 5px;
+            border-radius: 8px 8px 0 0;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            font-size: 0.9em;
+            user-select: none;
+            border: 1px solid transparent;
+            border-bottom: none;
+            max-width: 200px;
+        }
+        
+        .tab:hover { background: #333; color: #fff; }
+        
+        .tab.active {
+            background: var(--surf);
+            color: var(--prim);
+            border: 1px solid var(--border);
+            border-bottom: 1px solid var(--surf);
+            margin-bottom: -1px;
+            font-weight: bold;
+            z-index: 10;
+        }
+
+        .tab-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 8px; }
+        .tab-close { font-size: 1.1em; line-height: 0.8; border-radius: 50%; padding: 0 4px; color: #666; }
+        .tab-close:hover { background: #cc0000; color: white; }
+        .new-tab-btn { padding: 5px 10px; font-size: 1.2em; cursor: pointer; color: var(--sec); font-weight: bold; }
+        .new-tab-btn:hover { color: #fff; transform: scale(1.1); }
+
+        /* MAIN CONTENT */
+        .main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--surf); position: relative; z-index: 1; }
+        
+        .status-bar { 
+            padding: 8px 20px; 
+            border-bottom: 1px solid var(--border); 
+            display: flex; justify-content: space-between; align-items: center; 
+            background: rgba(30,30,30,0.9);
+            font-size: 0.9em;
+        }
+
+        .chat-window { 
+            flex: 1; 
+            overflow-y: auto; 
+            padding: 20px; 
+            display: flex; 
+            flex-direction: column; 
+            gap: 15px;
+            /* CRUCIAL: Espacio al final para que la barra flotante no tape mensajes */
+            padding-bottom: 100px; 
+        }
+        
+        .msg { max-width: 80%; padding: 10px 15px; border-radius: 12px; line-height: 1.5; position: relative; word-wrap: break-word; }
+        .msg-content { white-space: pre-wrap; }
+        .msg.user { align-self: flex-end; background: #2b3a55; border-top-right-radius: 2px; }
+        .msg.ai { align-self: flex-start; background: #2a2a2a; border-top-left-radius: 2px; }
+        .msg-meta { font-size: 0.7em; color: #888; margin-top: 5px; display: flex; justify-content: flex-end; gap: 10px;}
+        .copy-icon { cursor: pointer; }
+
+        /* --- INPUT AREA FLOTANTE (FLOATING BAR) --- */
+        .input-area { 
+            position: fixed; /* FUERZA que esté siempre visible en pantalla */
+            bottom: 25px;    /* Elevado del fondo */
+            left: 50%;
+            transform: translateX(-50%); /* Centrado horizontal */
+            width: 90%;
+            max-width: 800px;
+            background: #252525; 
+            padding: 10px; 
+            border-radius: 15px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5); /* Sombra para que destaque */
+            border: 1px solid #444;
+            display: flex; 
+            gap: 10px; 
+            z-index: 1000; /* Siempre encima de todo */
+        }
+        
+        input[type="text"] { flex: 1; background: #121212; border: 1px solid #444; color: #fff; padding: 12px; border-radius: 8px; outline: none; }
+        input[type="text"]:focus { border-color: var(--prim); }
+        .btn { background: var(--prim); color: white; border: none; padding: 0 20px; border-radius: 8px; cursor: pointer; font-weight: bold; }
+        .btn-icon { background: transparent; border: 1px solid #555; color: #ddd; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 0.85em; }
+
+        /* Modal Settings */
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 2000; justify-content: center; align-items: center; }
+        .modal-box { background: #1e1e1e; padding: 25px; border-radius: 8px; width: 600px; max-width: 90%; max-height: 90vh; overflow-y: auto; border: 1px solid #444;}
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        label { display: block; margin-top: 10px; color: var(--sec); font-size: 0.9em; }
+        select, textarea, input { width: 100%; background: #2c2c2c; border: 1px solid #555; color: #fff; padding: 8px; border-radius: 4px; box-sizing: border-box; }
+        .badge { background: #333; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; cursor: pointer; margin-right: 5px; display: inline-block; margin-top: 5px; border:1px solid #555;}
+        .badge:hover { background: var(--prim); color: #000; }
+        
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #121212; }
+        ::-webkit-scrollbar-thumb { background: #444; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+    <div class="tab-bar" id="tabBar">
+        <div class="new-tab-btn" onclick="newChat()" title="Nuevo Chat">+</div>
+    </div>
+
+    <div class="main">
+        <div class="status-bar">
+            <span id="connStatus" style="color:#aaa;">⚪ Conectando...</span>
+            <div>
+                <button class="btn-icon" onclick="exportChat()">📤 Exportar</button>
+                <button class="btn-icon" onclick="document.getElementById('settingsModal').style.display='flex'">⚙️ Ajustes</button>
+            </div>
+        </div>
+
+        <div class="chat-window" id="chatWindow">
+            </div>
+
+        <div class="input-area">
+            <input type="text" id="userInput" autocomplete="off" placeholder="Escribe un mensaje..." onkeypress="if(event.key==='Enter') sendMsg()">
+            <button class="btn" onclick="sendMsg()" id="sendBtn">Enviar</button>
+        </div>
+    </div>
+
+    <div id="settingsModal" class="modal">
+        <div class="modal-box">
+            <div style="display:flex; justify-content:space-between;">
+                <h2 style="margin:0; color:var(--prim)">⚙️ Configuración</h2>
+                <span style="cursor:pointer; font-size:1.5em;" onclick="document.getElementById('settingsModal').style.display='none'">&times;</span>
+            </div>
+            <form id="confForm">
+                <div class="grid">
+                    <div><label>Modelo IA</label><select name="model">{% for m in models %}<option value="{{m}}" {% if config.model==m %}selected{% endif %}>{{m}}</option>{% endfor %}</select></div>
+                    <div><label>Voz Robot</label><select name="voice">{% for v in voices %}<option value="{{v.id}}" {% if config.voice==v.id %}selected{% endif %}>{{v.name}}</option>{% endfor %}</select></div>
+                </div>
+                <label>Personalidad</label>
+                <div>{% for k in presets %}<span class="badge" onclick="setPrompt('{{k}}')">{{k}}</span>{% endfor %}</div>
+                <textarea id="sysPrompt" name="system_prompt" rows="3" style="margin-top:5px">{{ config.system_prompt }}</textarea>
+                <div class="grid">
+                    <div><label>Ganancia Mic: <span id="gv">{{config.mic_gain}}</span></label><input type="range" name="mic_gain" min="0.5" max="5.0" step="0.1" value="{{config.mic_gain}}" oninput="document.getElementById('gv').innerText=this.value"></div>
+                    <div><label>Temp IA: <span id="tv">{{config.llm_temperature}}</span></label><input type="range" name="llm_temperature" min="0" max="1" step="0.1" value="{{config.llm_temperature}}" oninput="document.getElementById('tv').innerText=this.value"></div>
+                </div>
+                <label>API Key Groq</label><input type="password" name="groq_api_key" value="{{ config.groq_api_key }}">
+                <button type="button" class="btn" style="width:100%; margin-top:15px;" onclick="saveConf()">Guardar Cambios</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        const PRESETS = {{ presets_json | safe }};
+        let activeChatId = "{{ active_id }}";
+
+        function setPrompt(k) { if(PRESETS[k]) document.getElementById('sysPrompt').value = PRESETS[k]; }
+        
+        function loadChats() {
+            fetch('/api/chats').then(r=>r.json()).then(d => {
+                const bar = document.getElementById('tabBar');
+                const btn = bar.querySelector('.new-tab-btn');
+                Array.from(bar.children).forEach(c => { if(!c.classList.contains('new-tab-btn')) c.remove(); });
+                Object.keys(d.sessions).forEach(id => {
+                    const s = d.sessions[id];
+                    const tab = document.createElement('div');
+                    tab.className = `tab ${id===d.active_id?'active':''}`;
+                    tab.innerHTML = `<span class="tab-name" onclick="switchChat('${id}')">${s.name}</span><span class="tab-close" onclick="delChat('${id}')">&times;</span>`;
+                    bar.insertBefore(tab, btn);
+                });
+                activeChatId = d.active_id;
+            });
+        }
+
+        function renderMsgs() {
+            fetch('/api/messages').then(r=>r.json()).then(msgs => {
+                const w = document.getElementById('chatWindow');
+                // IMPORTANTE: Detectamos si hay que hacer scroll antes de cambiar el HTML
+                const isBottom = w.scrollHeight - w.scrollTop <= w.clientHeight + 200; 
+                
+                const html = msgs.map(m => `
+                    <div class="msg ${m.role}">
+                        <div class="msg-content">${m.text}</div>
+                        <div class="msg-meta">${m.time} <span class="copy-icon" onclick="copyTxt(this)">📋</span></div>
+                    </div>`).join('');
+                
+                if(w.innerHTML !== html) {
+                    w.innerHTML = html;
+                    if(isBottom) w.scrollTop = w.scrollHeight;
+                }
+            });
+        }
+
+        function sendMsg() {
+            const inp = document.getElementById('userInput');
+            const txt = inp.value.trim();
+            if(!txt) return;
+            inp.value = '';
+            const w = document.getElementById('chatWindow');
+            w.innerHTML += `<div class="msg user"><div class="msg-content">${txt}</div><div class="msg-meta">...</div></div>`;
+            w.scrollTop = w.scrollHeight;
+            fetch('/api/send_text', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: txt})});
+        }
+
+        function newChat() { const n = prompt("Nombre:", "Chat " + new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})); if(n) fetch('/api/new_chat', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}).then(loadChats); }
+        function switchChat(id) { fetch('/api/switch_chat/'+id).then(loadChats).then(renderMsgs); }
+        function delChat(id) { event.stopPropagation(); if(confirm("¿Cerrar?")) fetch('/api/delete_chat/'+id).then(loadChats); }
+        function saveConf() { fetch('/save_config', {method:'POST', body: new FormData(document.getElementById('confForm'))}).then(()=>alert('Guardado!')); }
+        function copyTxt(el) { navigator.clipboard.writeText(el.closest('.msg').querySelector('.msg-content').innerText); }
+        function exportChat() { window.open('/api/export_chat', '_blank'); }
+
+        setInterval(() => {
+            renderMsgs();
+            fetch('/api/status').then(r=>r.json()).then(d => {
+                const badge = document.getElementById('connStatus');
+                if(d.connected) { badge.style.color = "#00ff00"; badge.innerText = "🟢 Robot Conectado"; } 
+                else { badge.style.color = "#aaa"; badge.innerText = "⚪ Modo Offline"; }
+            });
+        }, 1500);
+
+        loadChats(); renderMsgs();
+    </script>
+</body>
+</html>
+"""
+
+# --- RUTAS API (Sin cambios) ---
+@app.route('/')
+def index(): return render_template_string(HTML_TEMPLATE, config=config, models=GROQ_MODELS, voices=VOICE_OPTIONS, presets=PROMPT_PRESETS, presets_json=json.dumps(PROMPT_PRESETS), active_id=chat_db["active_id"])
+@app.route('/api/chats')
+def get_chats(): return jsonify(chat_db)
+@app.route('/api/messages')
+def get_messages(): aid=chat_db["active_id"]; return jsonify(chat_db["sessions"][aid]["messages"] if aid in chat_db["sessions"] else [])
+@app.route('/api/new_chat', methods=['POST'])
+def new_chat_api(): name=request.json.get('name','Chat'); nid=str(uuid.uuid4()); chat_db["sessions"][nid]={"name":name,"created":str(datetime.now()),"messages":[]}; chat_db["active_id"]=nid; save_chats(chat_db); return jsonify({"status":"ok"})
+@app.route('/api/switch_chat/<id>')
+def switch_chat_api(id): 
+    if id in chat_db["sessions"]: chat_db["active_id"]=id; save_chats(chat_db)
+    return jsonify({"status":"ok"})
+@app.route('/api/delete_chat/<id>')
+def delete_chat_api(id):
+    if id in chat_db["sessions"] and len(chat_db["sessions"])>1:
+        del chat_db["sessions"][id]
+        if chat_db["active_id"]==id: chat_db["active_id"]=list(chat_db["sessions"].keys())[0]
+        save_chats(chat_db)
+    return jsonify({"status":"ok"})
+@app.route('/api/send_text', methods=['POST'])
+def send_text_api():
+    global active_ws; txt=request.json.get('text'); 
+    if not txt: return jsonify({"error":"empty"}),400
+    add_message("user", txt)
+    try:
+        client=Groq(api_key=config['groq_api_key'])
+        completion=client.chat.completions.create(model=config['model'],messages=[{"role":"system","content":config['system_prompt']},{"role":"user","content":txt}],temperature=config['llm_temperature'])
+        ai_resp=completion.choices[0].message.content; add_message("ai", ai_resp)
+        if active_ws: speak_to_robot(ai_resp, active_ws)
+    except Exception as e: add_message("ai", f"Error: {e}")
+    return jsonify({"status":"ok"})
+@app.route('/api/status')
+def status_api(): return jsonify({"connected": active_ws is not None})
+@app.route('/api/export_chat')
+def export_chat_api():
+    aid=chat_db["active_id"]; s=chat_db["sessions"][aid]; out=f"CHAT: {s['name']}\n\n"; 
+    for m in s["messages"]: out+=f"[{m['time']}] {m['role'].upper()}:\n{m['text']}\n{'-'*20}\n"
+    return Response(out, mimetype="text/plain", headers={"Content-Disposition":"attachment;filename=chat.txt"})
+@app.route('/save_config', methods=['POST'])
+def save_conf_route():
+    global config; config.update({"groq_api_key":request.form.get('groq_api_key'),"system_prompt":request.form.get('system_prompt'),"model":request.form.get('model'),"voice":request.form.get('voice'),"mic_gain":float(request.form.get('mic_gain')),"llm_temperature":float(request.form.get('llm_temperature'))}); save_app_config(config); return jsonify({"status":"ok"})
+@sock.route('/ws')
+def ws_handler(ws):
+    global active_ws; active_ws=ws; log_system("🔌 ROBOT CONECTADO"); decoder=opuslib.Decoder(INPUT_RATE, INPUT_CHANNELS) if opuslib else None; pcm_buffer=b""; is_rec=False; start=0; last=0
+    try:
+        while True:
+            data=ws.receive()
+            if isinstance(data,str):
+                msg=json.loads(data)
+                if msg.get('type')=='hello': ws.send(json.dumps({"type":"hello","transport":"websocket","audio_params":{"format":"opus","sample_rate":16000,"channels":1,"frame_duration":60}}))
+                if msg.get('type')=='listen' and msg.get('state')=='start': pcm_buffer=b""; is_rec=True; start=time.time(); last=time.time()
+            elif isinstance(data,bytes) and is_rec:
+                try:
+                    chunk=decoder.decode(data, FRAME_SIZE) if decoder else data; pcm_buffer+=chunk
+                    if get_rms(chunk)>config['silence_threshold']: last=time.time()
+                    if (time.time()-last)>config['silence_duration'] and (time.time()-start)>1.5: is_rec=False; ws.send(json.dumps({"type":"tts","state":"stop"})); process_voice_interaction(pcm_buffer, ws); pcm_buffer=b""
+                except: pass
+    except: pass
+    finally:
+        if active_ws==ws: active_ws=None; log_system("🔌 Desconectado")
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000, threaded=True)
